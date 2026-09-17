@@ -27,6 +27,8 @@ def create_job(job_type: str, input_path: Optional[str] = None, original_size_mb
             "input_path": input_path,
             "output_path": None,
             "candidates": [],
+            "already_optimal": False,
+            "message": None,
             "created_at": time.time(),
         }
     return job_id

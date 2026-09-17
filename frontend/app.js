@@ -175,11 +175,25 @@ function pollCompressionStatus(jobId) {
         document.getElementById("metric-orig-size").textContent = `${job.original_size_mb} MB`;
         document.getElementById("metric-comp-size").textContent = `${job.compressed_size_mb} MB`;
         
-        let savedPct = 0;
-        if (job.original_size_mb > 0 && job.compressed_size_mb !== null) {
-          savedPct = Math.max(0, Math.round((1 - job.compressed_size_mb / job.original_size_mb) * 100));
+        const optimalNotice = document.getElementById("compress-optimal-notice");
+        const btnText = document.getElementById("compress-download-btn-text");
+
+        if (job.already_optimal) {
+          if (optimalNotice) {
+            document.getElementById("compress-optimal-message").textContent = job.message || "This file is already efficiently compressed. Compression could not reduce it further.";
+            optimalNotice.style.display = "flex";
+          }
+          document.getElementById("metric-saved-pct").textContent = "0%";
+          if (btnText) btnText.textContent = "Download Original PDF";
+        } else {
+          if (optimalNotice) optimalNotice.style.display = "none";
+          let savedPct = 0;
+          if (job.original_size_mb > 0 && job.compressed_size_mb !== null) {
+            savedPct = Math.max(0, Math.round((1 - job.compressed_size_mb / job.original_size_mb) * 100));
+          }
+          document.getElementById("metric-saved-pct").textContent = `${savedPct}%`;
+          if (btnText) btnText.textContent = "Download Compressed PDF";
         }
-        document.getElementById("metric-saved-pct").textContent = `${savedPct}%`;
 
         const dlBtn = document.getElementById("compress-download-btn");
         dlBtn.href = job.download_url;

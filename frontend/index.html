@@ -99,6 +99,12 @@
         <div id="compress-error" class="error-banner"></div>
 
         <div id="compress-result" class="result-box">
+          <div id="compress-optimal-notice" class="system-alert" style="display: none; margin-bottom: 1.25rem;">
+            <div>
+              <strong>Notice:</strong>
+              <span id="compress-optimal-message">This file is already efficiently compressed. Compression could not reduce it further.</span>
+            </div>
+          </div>
           <div class="result-metrics">
             <div>
               <div class="metric-label">Original</div>
@@ -119,7 +125,7 @@
               <polyline points="7 10 12 15 17 10"></polyline>
               <line x1="12" y1="15" x2="12" y2="3"></line>
             </svg>
-            Download Compressed PDF
+            <span id="compress-download-btn-text">Download Compressed PDF</span>
           </a>
         </div>
       </div>

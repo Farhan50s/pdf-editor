@@ -166,6 +166,34 @@ def make_password_protected_pdf(target_path: Path, password: str = "secret123"):
     c.save()
 
 
+def make_ccitt_scanned_pdf(target_path: Path, num_pages: int = 3):
+    """
+    Generates a low-size scanned-style PDF with 1-bit monochrome CCITT Group 4 images.
+    This simulates an already efficiently compressed / CCITT-encoded scanned PDF.
+    """
+    if target_path.exists() and target_path.stat().st_size > 500:
+        return
+
+    import fitz
+
+    doc = fitz.open()
+    for page_idx in range(num_pages):
+        img = PILImage.new("1", (600, 800), 1)
+        draw = PILImageDraw.Draw(img)
+        for y in range(80, 750, 25):
+            draw.line([(50, y), (550, y)], fill=0, width=1)
+        draw.text((60, 40), f"SCANNED ARCHIVE RECORD - PAGE {page_idx + 1}", fill=0)
+
+        buf = io.BytesIO()
+        img.save(buf, format="TIFF", compression="group4")
+        page = doc.new_page(width=595, height=842)
+        page.insert_image(page.rect, stream=buf.getvalue())
+
+    doc.save(str(target_path), garbage=4, deflate=True, clean=True)
+    doc.close()
+    print(f"[Fixtures] Generated ccitt_scanned.pdf with size: {target_path.stat().st_size} bytes")
+
+
 def generate_all_fixtures():
     """Generates all test PDFs into tests/fixtures/ with caching."""
     logo_path = FIXTURES_DIR / "sample_logo.png"
@@ -191,6 +219,9 @@ def generate_all_fixtures():
 
     print("[Fixtures] Generating password_protected.pdf...")
     make_password_protected_pdf(FIXTURES_DIR / "password_protected.pdf", password="secret123")
+
+    print("[Fixtures] Generating ccitt_scanned.pdf...")
+    make_ccitt_scanned_pdf(FIXTURES_DIR / "ccitt_scanned.pdf", num_pages=3)
 
     print("[Fixtures] All test fixtures ready in tests/fixtures/.")
 

@@ -97,7 +97,9 @@ async def compress_status(job_id: str):
         "original_size_mb": job.get("original_size_mb", 0.0),
         "compressed_size_mb": job.get("compressed_size_mb"),
         "download_url": job.get("download_url"),
-        "error_message": job.get("error_message")
+        "error_message": job.get("error_message"),
+        "already_optimal": job.get("already_optimal", False),
+        "message": job.get("message")
     }
 
 

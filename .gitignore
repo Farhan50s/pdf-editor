@@ -1,0 +1,16 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.class
+.pytest_cache/
+
+# Application temporary files and logs
+backend/temp/*
+!backend/temp/.gitkeep
+backend/logs/*
+!backend/logs/.gitkeep
+
+# Environment
+.env
+venv/
+.venv/
