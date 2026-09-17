@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PDF Tool — Local Compressor & Watermark Remover</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>
+        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+          <polyline points="14 2 14 8 20 8"></polyline>
+          <line x1="16" y1="13" x2="8" y2="13"></line>
+          <line x1="16" y1="17" x2="8" y2="17"></line>
+          <polyline points="10 9 9 9 8 9"></polyline>
+        </svg>
+        PDF Tool
+      </h1>
+      <p>High-performance local PDF compressor and precision watermark remover</p>
+    </header>
+
+    <div id="gs-alert" class="system-alert" style="display: none;">
+      <div>
+        <strong>Ghostscript Notice:</strong> <span id="gs-alert-text">Ghostscript was not detected in PATH. Compression will use fallback mode.</span>
+      </div>
+    </div>
+
+    <!-- Dual Tab Navigation -->
+    <div class="tabs-nav">
+      <button class="tab-btn active" id="tab-btn-compress" onclick="switchTab('compress')">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polyline points="4 14 10 14 10 20"></polyline>
+          <polyline points="20 10 14 10 14 4"></polyline>
+          <line x1="14" y1="10" x2="21" y2="3"></line>
+          <line x1="3" y1="21" x2="10" y2="14"></line>
+        </svg>
+        Compress PDF
+      </button>
+      <button class="tab-btn" id="tab-btn-watermark" onclick="switchTab('watermark')">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path>
+          <polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline>
+          <line x1="12" y1="22.08" x2="12" y2="12"></line>
+        </svg>
+        Remove Watermark
+      </button>
+    </div>
+
+    <!-- Tab 1: Compression -->
+    <div id="tab-compress" class="tab-content active">
+      <div class="card">
+        <div class="dropzone" id="compress-dropzone">
+          <div class="dropzone-icon">📁</div>
+          <div class="dropzone-text">Drag and drop your PDF here, or browse</div>
+          <div class="dropzone-hint">Supports documents up to 500+ pages / 100MB</div>
+          <input type="file" id="compress-file-input" accept=".pdf" style="display: none;">
+        </div>
+
+        <div id="compress-file-badge" class="file-info-badge" style="display: none;">
+          <span class="file-info-name" id="compress-file-name">filename.pdf</span>
+          <span class="file-info-size" id="compress-file-size">0.0 MB</span>
+        </div>
+
+        <div class="controls-group">
+          <div class="group-title">Select Compression Level</div>
+          <div class="button-grid">
+            <button type="button" class="level-btn" onclick="selectLevel('low')" id="btn-level-low">
+              <span class="level-name">Low Compression</span>
+              <span class="level-desc">High quality (prepress)</span>
+            </button>
+            <button type="button" class="level-btn selected" onclick="selectLevel('medium')" id="btn-level-medium">
+              <span class="level-name">Medium</span>
+              <span class="level-desc">Balanced (eBook)</span>
+            </button>
+            <button type="button" class="level-btn" onclick="selectLevel('high')" id="btn-level-high">
+              <span class="level-name">High Compression</span>
+              <span class="level-desc">Smallest size (screen)</span>
+            </button>
+          </div>
+
+          <button id="btn-compress-submit" class="btn-primary" onclick="startCompression()" disabled>
+            Compress PDF
+          </button>
+        </div>
+
+        <div id="compress-progress" class="progress-box">
+          <div class="progress-header">
+            <span id="compress-progress-status">Compressing PDF...</span>
+            <span id="compress-progress-percent">0%</span>
+          </div>
+          <div class="progress-track">
+            <div id="compress-progress-bar" class="progress-fill"></div>
+          </div>
+        </div>
+
+        <div id="compress-error" class="error-banner"></div>
+
+        <div id="compress-result" class="result-box">
+          <div class="result-metrics">
+            <div>
+              <div class="metric-label">Original</div>
+              <div class="metric-value" id="metric-orig-size">0 MB</div>
+            </div>
+            <div>
+              <div class="metric-label">Compressed</div>
+              <div class="metric-value" id="metric-comp-size">0 MB</div>
+            </div>
+            <div>
+              <div class="metric-label">Saved</div>
+              <div class="metric-value" id="metric-saved-pct">0%</div>
+            </div>
+          </div>
+          <a id="compress-download-btn" href="#" class="btn-download" download>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+              <polyline points="7 10 12 15 17 10"></polyline>
+              <line x1="12" y1="15" x2="12" y2="3"></line>
+            </svg>
+            Download Compressed PDF
+          </a>
+        </div>
+      </div>
+    </div>
+
+    <!-- Tab 2: Watermark Removal -->
+    <div id="tab-watermark" class="tab-content">
+      <div class="card">
+        <div class="dropzone" id="wm-dropzone">
+          <div class="dropzone-icon">🎯</div>
+          <div class="dropzone-text">Drag and drop your watermarked PDF here, or browse</div>
+          <div class="dropzone-hint">Detects repeated text stamps, logos, and vector art</div>
+          <input type="file" id="wm-file-input" accept=".pdf" style="display: none;">
+        </div>
+
+        <div id="wm-file-badge" class="file-info-badge" style="display: none;">
+          <span class="file-info-name" id="wm-file-name">filename.pdf</span>
+          <span class="file-info-size" id="wm-file-size">0.0 MB</span>
+        </div>
+
+        <button id="btn-wm-detect" class="btn-primary" onclick="startWatermarkDetection()" disabled>
+          Detect Watermark
+        </button>
+
+        <div id="wm-detect-loading" style="display: none; text-align: center; margin-top: 1.5rem; color: var(--text-muted);">
+          <div class="spinner" style="border-top-color: var(--primary); margin-bottom: 0.5rem;"></div>
+          <div>Scanning document pages for repeating watermark patterns...</div>
+        </div>
+
+        <div id="wm-scanned-warning" class="system-alert" style="display: none; margin-top: 1.5rem;">
+          <div>
+            <strong>Notice:</strong> This looks like a scanned PDF. Watermark removal works best on digital text and separate image watermark objects.
+          </div>
+        </div>
+
+        <!-- Candidates Section -->
+        <div id="wm-candidates-section" class="candidates-container">
+          <div class="group-title">Detected Watermark Candidates</div>
+          <p style="font-size: 0.875rem; color: var(--text-muted); margin-bottom: 0.75rem;">
+            Select the watermark candidate you want to remove. Page 1 preview highlights the item with a red outline:
+          </p>
+          <div id="wm-candidates-grid" class="candidates-grid"></div>
+
+          <button id="btn-wm-remove" class="btn-primary" onclick="startWatermarkRemoval()" style="margin-top: 1.25rem;">
+            Remove Watermark from All Pages
+          </button>
+        </div>
+
+        <!-- Watermark Removal Progress -->
+        <div id="wm-progress" class="progress-box">
+          <div class="progress-header">
+            <span id="wm-progress-status">Cleaning pages...</span>
+            <span id="wm-progress-percent">0%</span>
+          </div>
+          <div class="progress-track">
+            <div id="wm-progress-bar" class="progress-fill"></div>
+          </div>
+        </div>
+
+        <div id="wm-error" class="error-banner"></div>
+
+        <!-- Watermark Removal Result -->
+        <div id="wm-result" class="result-box">
+          <div style="text-align: center; margin-bottom: 1.25rem;">
+            <div style="font-size: 1.2rem; font-weight: 700; color: #14532d;">
+              ✓ Watermark Successfully Removed
+            </div>
+            <div style="font-size: 0.9rem; color: #166534; margin-top: 0.25rem;" id="wm-cleaned-summary">
+              All pages cleaned and verified.
+            </div>
+          </div>
+          <a id="wm-download-btn" href="#" class="btn-download" download>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+              <polyline points="7 10 12 15 17 10"></polyline>
+              <line x1="12" y1="15" x2="12" y2="3"></line>
+            </svg>
+            Download Cleaned PDF
+          </a>
+        </div>
+      </div>
+    </div>
+
+    <footer>
+      <span>Local PDF Tool • Runs 100% on localhost • No files uploaded to the internet</span>
+    </footer>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
