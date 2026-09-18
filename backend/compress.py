@@ -39,8 +39,10 @@ OPTIMAL_COMPRESSION_MESSAGE = "This file is already efficiently compressed. Comp
 def analyze_image_characteristics(img_dict: dict, pil_img: Image.Image) -> Tuple[bool, bool]:
     """
     Analyzes an extracted PDF image to determine:
-    1. is_halftone_or_1bit: True if image is 1-bit or has high edge/noise density typical of a halftone scan.
+    1. is_halftone: True if image is 1-bit or has high edge/noise density typical of a halftone scan.
     2. is_scanned_text: True if image contains scanned document text (paper background with dark text).
+    
+    Uses dynamic background luminance (90th percentile) to handle aged, yellowish, or grayish paper (160-195).
     """
     # 1. Direct 1-bit or CCITT/JBIG2 check
     if (
@@ -50,39 +52,49 @@ def analyze_image_characteristics(img_dict: dict, pil_img: Image.Image) -> Tuple
     ):
         return True, True
 
-    # 2. Analyze pixel statistics
     try:
-        gray = pil_img.convert("L")
-        w, h = gray.size
+        w, h = pil_img.size
         if w < 100 or h < 100:
             return False, False
 
-        # Sample for fast, bounded execution time
-        if w > 600 or h > 600:
-            sample = gray.resize((min(w, 600), min(h, 600)), Image.Resampling.BILINEAR)
+        # Detect grayscale / low-saturation (monochrome or document scan)
+        if pil_img.mode in ("1", "L", "P"):
+            is_doc_scan = True
         else:
-            sample = gray
+            # Sample up to 600x600 for performance
+            rgb_sample = pil_img.resize((min(w, 600), min(h, 600)), Image.Resampling.BILINEAR) if (w > 600 or h > 600) else pil_img
+            rgb_arr = np.array(rgb_sample.convert("RGB"), dtype=np.int16)
+            R = rgb_arr[:, :, 0]
+            G = rgb_arr[:, :, 1]
+            B = rgb_arr[:, :, 2]
+            rg_diff = np.abs(R - G)
+            gb_diff = np.abs(G - B)
+            # Check if across 95% of pixels differences are < 12 (or p95 <= 14)
+            is_doc_scan = bool(
+                np.mean((rg_diff < 12) & (gb_diff < 12)) >= 0.90
+                or (np.percentile(rg_diff, 95) <= 14 and np.percentile(gb_diff, 95) <= 14)
+            )
 
-        arr = np.array(sample, dtype=np.float32)
-        white_ratio = float(np.mean(arr > 200))
-        dark_ratio = float(np.mean(arr < 100))
+        # Dynamic background luminance calculation: 90th percentile luminance
+        gray = pil_img.convert("L")
+        sample_gray = gray.resize((min(w, 600), min(h, 600)), Image.Resampling.BILINEAR) if (w > 600 or h > 600) else gray
+        arr = np.array(sample_gray, dtype=np.float32)
 
-        # Measure high-frequency pixel-to-pixel transitions (edge/noise density)
-        dh = np.abs(arr[:, 1:] - arr[:, :-1]) > 30
-        dv = np.abs(arr[1:, :] - arr[:-1, :]) > 30
+        bg_lum = float(np.percentile(arr, 90))
+        # Paper background threshold: [bg_lum - 25, 255]
+        bg_thresh = bg_lum - 25.0
+
+        # Edge density relative to dynamic background: transitions where at least one pixel is non-background (< bg_thresh)
+        dh = (np.abs(arr[:, 1:] - arr[:, :-1]) > 15) & ((arr[:, 1:] < bg_thresh) | (arr[:, :-1] < bg_thresh))
+        dv = (np.abs(arr[1:, :] - arr[:-1, :]) > 15) & ((arr[1:, :] < bg_thresh) | (arr[:-1, :] < bg_thresh))
         edge_density = float((np.mean(dh) + np.mean(dv)) / 2.0)
 
-        # Halftone scan: high-frequency dot noise across paper background
-        is_halftone = (
-            (white_ratio > 0.70 and edge_density > 0.02)
-            or edge_density > 0.08
-        )
+        # If document scan AND edge density > 0.008 (relative to dynamic background)
+        if is_doc_scan and edge_density > 0.008:
+            return True, True
 
-        # Scanned text: paper background with dark text strokes
-        is_scanned_text = (
-            (white_ratio > 0.65 and dark_ratio > 0.005 and edge_density > 0.015)
-            or is_halftone
-        )
+        is_halftone = bool(edge_density > 0.06)
+        is_scanned_text = bool(is_doc_scan and edge_density > 0.005)
 
         return is_halftone, is_scanned_text
     except Exception:
@@ -125,16 +137,15 @@ def check_pdf_contains_scanned_text_or_halftone(pdf_path: str, max_pages: int = 
 def validate_content_preservation(
     orig_path: str,
     compressed_path: str,
-    max_drop_threshold: float = 0.40
+    max_drop_threshold: float = 0.18
 ) -> Tuple[bool, Dict[str, Any]]:
     """
-    Perceptual content validation:
-    Renders 5 pages spread across the document, before and after compression,
-    at 100 DPI using page.get_pixmap(colorspace=fitz.csGRAY).
-    Computes average pixel darkness for each:
-        darkness = 1.0 - (mean(pixel_samples) / 255.0)
-    If any sampled page's darkness dropped by more than max_drop_threshold (e.g. 40%),
-    flags as content loss so Pass 2 is discarded.
+    Robust perceptual content validation:
+    1. Samples 12 pages evenly spaced throughout the document (np.linspace).
+    2. Watermark Exclusion Band: Crops central body area (top 12% to bottom 90% of page height)
+       to prevent static header/footer watermarks from masking body text loss.
+    3. Tightened rejection threshold: If body ink density drops by more than 18% on ANY
+       sampled page, flags as content loss.
     """
     if not os.path.exists(compressed_path) or os.path.getsize(compressed_path) == 0:
         return False, {"error": "Output file missing or empty"}
@@ -145,28 +156,33 @@ def validate_content_preservation(
                 return False, {"error": "Page count mismatch or encrypted output"}
 
             N = doc_orig.page_count
-            if N <= 5:
+            if N <= 12:
                 sample_indices = list(range(N))
             else:
-                sample_indices = sorted(list(set([
-                    0,
-                    N // 4,
-                    N // 2,
-                    (3 * N) // 4,
-                    N - 1
-                ])))
+                sample_indices = sorted(list(set(np.linspace(0, N - 1, 12, dtype=int).tolist())))
 
             zoom = 100.0 / 72.0
             mat = fitz.Matrix(zoom, zoom)
 
             for p_idx in sample_indices:
-                pix_orig = doc_orig[p_idx].get_pixmap(matrix=mat, colorspace=fitz.csGRAY)
+                p_orig = doc_orig[p_idx]
+                p_comp = doc_comp[p_idx]
+
+                # Watermark Exclusion Band: crop central body area (excluding top 12% and bottom 10%)
+                body_rect = fitz.Rect(
+                    0,
+                    p_orig.rect.height * 0.12,
+                    p_orig.rect.width,
+                    p_orig.rect.height * 0.90
+                )
+
+                pix_orig = p_orig.get_pixmap(matrix=mat, colorspace=fitz.csGRAY, clip=body_rect)
                 darkness_orig = 1.0 - (sum(pix_orig.samples) / (len(pix_orig.samples) * 255.0))
 
-                pix_comp = doc_comp[p_idx].get_pixmap(matrix=mat, colorspace=fitz.csGRAY)
+                pix_comp = p_comp.get_pixmap(matrix=mat, colorspace=fitz.csGRAY, clip=body_rect)
                 darkness_comp = 1.0 - (sum(pix_comp.samples) / (len(pix_comp.samples) * 255.0))
 
-                # Only evaluate drop if original page had non-trivial content (not blank paper)
+                # If original body area had ink content (not blank white paper), evaluate drop
                 if darkness_orig >= 0.005:
                     drop = (darkness_orig - darkness_comp) / darkness_orig
                     if drop > max_drop_threshold:
@@ -175,7 +191,7 @@ def validate_content_preservation(
                             "darkness_orig": round(darkness_orig, 4),
                             "darkness_comp": round(darkness_comp, 4),
                             "drop_pct": round(drop * 100, 2),
-                            "error": f"Content loss detected on page {p_idx}: darkness dropped by {round(drop * 100, 1)}%"
+                            "error": f"Content loss detected in body of page {p_idx}: ink density dropped by {round(drop * 100, 1)}% (> {round(max_drop_threshold * 100)}%)"
                         }
 
             return True, {"pages_checked": sample_indices}
@@ -189,9 +205,9 @@ def compress_with_pymupdf(input_path: str, output_path: str, level: str = "mediu
     Fallback compression engine using PyMuPDF and PIL optimization.
     Used when Ghostscript is not installed on the host system.
     Safeguards:
-    1. 1-bit or halftone scans are excluded from JPEG re-encoding.
-    2. Scanned text images never drop below JPEGQ=80.
-    3. Low JPEGQ is strictly reserved for continuous-tone photos.
+    1. Any image classified as halftone or scanned text is STRICTLY EXCLUDED from lossy JPEG
+       re-encoding and downsampling. Retained in original lossless Flate/CCITT/JBIG2 format.
+    2. Low JPEGQ is strictly reserved for continuous-tone photos.
     """
     base_quality = 40 if aggressive else QUALITY_FALLBACK_MAP.get(level.lower(), 65)
 
@@ -216,27 +232,22 @@ def compress_with_pymupdf(input_path: str, output_path: str, level: str = "mediu
                     # 1. Analyze image characteristics
                     is_halftone, is_scanned_text = analyze_image_characteristics(img_dict, im)
 
-                    # Rule 1: If 1-bit or halftone scan, exclude from JPEG re-encoding!
-                    # Leave in original encoding (CCITT/JBIG2/Flate) untouched.
-                    if is_halftone:
+                    # Rule: For ANY image where is_halftone = True or is_scanned_text = True:
+                    # STRICTLY DISABLE resolution downsampling (no resizing).
+                    # Exclude from lossy JPEG re-encoding. Retain in lossless Flate/CCITT/JBIG2 untouched.
+                    if is_halftone or is_scanned_text:
                         continue
 
-                    # Rule 2: Never use JPEGQ below 80 for any image containing scanned text.
-                    # Reserve low JPEGQ only for genuine photo content.
-                    if is_scanned_text:
-                        quality = max(base_quality, 80)
-                    else:
-                        quality = base_quality
-
+                    # Continuous-tone photo content only:
                     if im.mode not in ("RGB", "L"):
                         im = im.convert("RGB")
 
-                    # Downsample only genuine photos in aggressive mode, never scanned text
-                    if aggressive and not is_scanned_text and (im.width > 1200 or im.height > 1200):
+                    # Downsample only genuine photos in aggressive mode
+                    if aggressive and (im.width > 1200 or im.height > 1200):
                         im.thumbnail((1200, 1200), Image.Resampling.LANCZOS)
 
                     buf = io.BytesIO()
-                    im.save(buf, format="JPEG", quality=quality, optimize=True)
+                    im.save(buf, format="JPEG", quality=base_quality, optimize=True)
                     new_bytes = buf.getvalue()
 
                     # Only replace stream if the compressed stream is actually smaller
@@ -259,12 +270,13 @@ def run_ghostscript_compression(
 ) -> Dict[str, Any]:
     """
     Executes PDF compression with 2-pass size-guard, halftone protection, and perceptual validation:
-    1. Halftone scans and 1-bit images are excluded from destructive JPEG re-encoding.
-    2. Scanned text images never drop below JPEGQ=80.
+    1. Halftone scans and scanned text images are excluded from destructive JPEG re-encoding and downsampling.
+    2. Dynamic background detection (90th percentile) reliably catches aged or yellowish book scans.
     3. Low compression skips aggressive Pass 2 (protects user quality choice).
     4. Large files (>200 pages) skip Pass 2 (avoids doubling execution time).
-    5. Pass 2 output is verified with 5-page perceptual pixel darkness checking.
-    6. Pass 1 temporary output is purged immediately when Pass 2 starts.
+    5. Content output is verified with 12-page body-cropped perceptual pixel darkness checking (18% threshold).
+    6. Minimal Yield Abort Gate reverts raster scans if size savings are < 5%.
+    7. Pass 1 temporary output is purged immediately when Pass 2 starts.
     """
     start_time = time.time()
     orig_bytes = os.path.getsize(input_path)
@@ -295,7 +307,7 @@ def run_ghostscript_compression(
     output_filename = f"compressed_{job_id}.pdf"
     output_path = str(TEMP_DIR / output_filename)
     pass1_output_path = str(TEMP_DIR / f"pass1_{job_id}.pdf")
-    update_job(job_id, status="processing", progress=25)
+    update_job(job_id, status="processing", start_time=time.time())
 
     gs_exe = find_ghostscript()
 
@@ -410,47 +422,10 @@ def run_ghostscript_compression(
     # Evaluate Pass 1 result
     pass1_bytes = os.path.getsize(pass1_output_path) if os.path.exists(pass1_output_path) else float('inf')
 
-    # If Pass 1 successfully reduced the file size:
-    if pass1_bytes < orig_bytes:
-        is_p1_valid, p1_val_details = validate_content_preservation(input_path, pass1_output_path, max_drop_threshold=0.40)
-        if is_p1_valid:
-            if os.path.exists(output_path):
-                cleanup_file_safely(output_path)
-            shutil.move(pass1_output_path, output_path)
-            final_comp_size_mb = get_file_size_mb(output_path)
-            download_url = f"/api/compress/download/{job_id}"
-            duration = round(time.time() - start_time, 2)
+    # Detect if document contains scanned text or halftone content
+    has_ht, has_st = check_pdf_contains_scanned_text_or_halftone(input_path)
+    is_raster_scan = bool(has_ht or has_st)
 
-            update_job(
-                job_id,
-                status="done",
-                progress=100,
-                original_size_mb=orig_size_mb,
-                compressed_size_mb=final_comp_size_mb,
-                output_path=output_path,
-                download_url=download_url,
-                already_optimal=False,
-                message=None
-            )
-            log_job_event(job_id, "compress_done_pass1", {
-                "level": level,
-                "orig_mb": orig_size_mb,
-                "compressed_mb": final_comp_size_mb,
-                "orig_bytes": orig_bytes,
-                "compressed_bytes": pass1_bytes,
-                "duration_sec": duration
-            })
-            return {
-                "status": "done",
-                "progress": 100,
-                "original_size_mb": orig_size_mb,
-                "compressed_size_mb": final_comp_size_mb,
-                "download_url": download_url,
-                "already_optimal": False,
-                "message": None
-            }
-
-    # Pass 1 was NOT smaller than original (or failed content validation)
     # Check eligibility for Pass 2:
     # Rule 1: Only run aggressive Pass 2 for Medium or High (for Low, skip straight to already_optimal)
     # Rule 2: Only run Pass 2 if document page count <= 200 (skip for > 200)
@@ -459,6 +434,56 @@ def run_ghostscript_compression(
         orig_page_count <= 200
     )
 
+    # If Pass 1 successfully reduced the file size:
+    if pass1_bytes < orig_bytes:
+        is_p1_valid, p1_val_details = validate_content_preservation(input_path, pass1_output_path, max_drop_threshold=0.18)
+        if is_p1_valid:
+            savings_ratio = (orig_bytes - pass1_bytes) / orig_bytes
+            # Minimal Yield Abort Gate: If savings < 5% on raster scan documents:
+            if is_raster_scan and savings_ratio < 0.05:
+                # If we cannot run Pass 2, abort to already_optimal to avoid raster artifacts for negligible gain (<5%)
+                if not can_run_pass2:
+                    cleanup_file_safely(pass1_output_path)
+                    return finish_as_already_optimal()
+                # If can_run_pass2 is True, proceed to Pass 2 below
+            else:
+                if os.path.exists(output_path):
+                    cleanup_file_safely(output_path)
+                shutil.move(pass1_output_path, output_path)
+                final_comp_size_mb = get_file_size_mb(output_path)
+                download_url = f"/api/compress/download/{job_id}"
+                duration = round(time.time() - start_time, 2)
+
+                update_job(
+                    job_id,
+                    status="done",
+                    progress=100,
+                    original_size_mb=orig_size_mb,
+                    compressed_size_mb=final_comp_size_mb,
+                    output_path=output_path,
+                    download_url=download_url,
+                    already_optimal=False,
+                    message=None
+                )
+                log_job_event(job_id, "compress_done_pass1", {
+                    "level": level,
+                    "orig_mb": orig_size_mb,
+                    "compressed_mb": final_comp_size_mb,
+                    "orig_bytes": orig_bytes,
+                    "compressed_bytes": pass1_bytes,
+                    "duration_sec": duration
+                })
+                return {
+                    "status": "done",
+                    "progress": 100,
+                    "original_size_mb": orig_size_mb,
+                    "compressed_size_mb": final_comp_size_mb,
+                    "download_url": download_url,
+                    "already_optimal": False,
+                    "message": None
+                }
+
+    # Pass 1 was NOT smaller than original (or failed content validation / minimal yield gate)
     if not can_run_pass2:
         skip_reason = "level_is_low" if level.lower() not in ("medium", "high") else f"page_count_{orig_page_count}_over_200"
         log_job_event(job_id, "compress_skip_pass2", {
@@ -483,7 +508,6 @@ def run_ghostscript_compression(
     # 3. Run Pass 2 (Aggressive Settings with Scanned Document Guards)
     if gs_exe:
         pdf_setting = SETTINGS_MAP.get(level.lower(), "/ebook")
-        has_ht, has_st = check_pdf_contains_scanned_text_or_halftone(input_path)
 
         # Rule 2: Never use JPEGQ below 80 for any image that contains scanned text
         jpeg_q = 80 if has_st else 60
@@ -531,9 +555,9 @@ def run_ghostscript_compression(
         except Exception as e:
             log_job_event(job_id, "compress_fallback_pass2_exception", {"error": str(e)})
 
-    # Rule 3: Perceptual content validation: render 5 pages before and after at 100 DPI
-    # If any page's darkness dropped by more than 40%, discard and fall back to already_optimal
-    is_valid_content, val_details = validate_content_preservation(input_path, output_path, max_drop_threshold=0.40)
+    # Rule 3: Perceptual content validation: render 12 pages before and after at 100 DPI
+    # If any page's body darkness dropped by more than 18%, discard and fall back to already_optimal
+    is_valid_content, val_details = validate_content_preservation(input_path, output_path, max_drop_threshold=0.18)
     if not is_valid_content:
         log_job_event(job_id, "compress_pass2_content_loss_fallback", val_details)
         cleanup_file_safely(output_path)
@@ -543,6 +567,17 @@ def run_ghostscript_compression(
 
     # Compare again: If still not smaller than original, stop trying. Do not return that file.
     if pass2_bytes >= orig_bytes:
+        cleanup_file_safely(output_path)
+        return finish_as_already_optimal()
+
+    # Minimal Yield Abort Gate: If final compressed size is within 5% of original (savings < 5%)
+    # on raster scan documents, revert to the original file to avoid visual degradation for negligible gain.
+    if is_raster_scan and ((orig_bytes - pass2_bytes) / orig_bytes < 0.05):
+        log_job_event(job_id, "compress_pass2_minimal_yield_abort", {
+            "orig_bytes": orig_bytes,
+            "pass2_bytes": pass2_bytes,
+            "savings_pct": round(((orig_bytes - pass2_bytes) / orig_bytes) * 100, 2)
+        })
         cleanup_file_safely(output_path)
         return finish_as_already_optimal()
 

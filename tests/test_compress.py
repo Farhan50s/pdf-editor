@@ -398,5 +398,117 @@ def test_compress_halftone_scanned_content_preservation():
         comp_doc.close()
 
 
+def test_compress_yellowed_scanned_with_watermark():
+    """
+    Test compression on an aged, yellowish background scanned book PDF (~180 background luminance)
+    with header/footer watermark overlay stamps.
+    Verifies:
+    1. Dynamic background detection correctly identifies scanned document text.
+    2. Body ink density is preserved within 18% (tested with watermark exclusion band).
+    3. If size savings are negligible (< 5%), the minimal yield gate aborts and serves the original file.
+    4. Text and equations remain fully readable, not wiped or degraded.
+    """
+    input_pdf = FIXTURES_DIR / "yellowed_scanned_watermark.pdf"
+    assert input_pdf.exists(), "yellowed_scanned_watermark.pdf fixture must exist."
+
+    orig_bytes = input_pdf.read_bytes()
+    orig_doc = fitz.open(str(input_pdf))
+    zoom = 100.0 / 72.0
+    mat = fitz.Matrix(zoom, zoom)
+    orig_body_darkness = []
+    
+    for page in orig_doc:
+        body_rect = fitz.Rect(0, page.rect.height * 0.12, page.rect.width, page.rect.height * 0.90)
+        pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY, clip=body_rect)
+        darkness = 1.0 - (sum(pix.samples) / (len(pix.samples) * 255.0))
+        orig_body_darkness.append(darkness)
+    orig_doc.close()
+
+    assert all(d > 0.01 for d in orig_body_darkness), "Original body area must contain ink"
+
+    with open(input_pdf, "rb") as f:
+        resp = client.post(
+            "/api/compress",
+            files={"file": ("yellowed_scan.pdf", f, "application/pdf")},
+            data={"level": "medium"}
+        )
+    assert resp.status_code == 200
+    job_id = resp.json()["job_id"]
+
+    start_poll = time.time()
+    status_data = None
+    while time.time() - start_poll < 60:
+        status_resp = client.get(f"/api/compress/status/{job_id}")
+        status_data = status_resp.json()
+        if status_data["status"] in ["done", "error"]:
+            break
+        time.sleep(1)
+
+    assert status_data["status"] == "done", f"Compression failed: {status_data.get('error_message')}"
+    assert status_data["download_url"] is not None
+
+    dl_resp = client.get(status_data["download_url"])
+    assert dl_resp.status_code == 200
+    dl_bytes = dl_resp.content
+
+    comp_doc = fitz.open(stream=dl_bytes, filetype="pdf")
+    assert comp_doc.page_count == len(orig_body_darkness)
+
+    # Verify body ink density on all pages within 18% threshold
+    for p_idx in range(comp_doc.page_count):
+        p = comp_doc[p_idx]
+        body_rect = fitz.Rect(0, p.rect.height * 0.12, p.rect.width, p.rect.height * 0.90)
+        pix_c = p.get_pixmap(matrix=mat, colorspace=fitz.csGRAY, clip=body_rect)
+        darkness_c = 1.0 - (sum(pix_c.samples) / (len(pix_c.samples) * 255.0))
+
+        assert darkness_c >= 0.01, f"Page {p_idx} body came back blank!"
+        d_orig = orig_body_darkness[p_idx]
+        rel_drop = (d_orig - darkness_c) / d_orig
+        assert rel_drop <= 0.18, (
+            f"Page {p_idx} body ink density dropped by {rel_drop * 100:.1f}% (> 18% allowed)"
+        )
+
+    comp_doc.close()
+
+    # If the file was not compressed by at least 5%, verify it returned already_optimal: True and served the original
+    if status_data["already_optimal"]:
+        assert dl_bytes == orig_bytes, "Must serve the original file when already_optimal is True"
+        assert status_data["message"] == "This file is already efficiently compressed. Compression could not reduce it further."
+    else:
+        savings = (len(orig_bytes) - len(dl_bytes)) / len(orig_bytes)
+        assert savings >= 0.05, f"Minimal yield gate failed: compressed file was served with savings of {savings*100:.2f}% (< 5%)"
+
+
+def test_minimal_yield_abort_gate_reverts_scanned_pdf(monkeypatch):
+    """
+    Direct test of the Minimal Yield Abort Gate:
+    If compression on a raster/scanned document yields < 5% savings,
+    verify that run_ghostscript_compression reverts to original and flags already_optimal: True.
+    """
+    import backend.compress as comp_mod
+    from backend.compress import run_ghostscript_compression
+
+    input_pdf = FIXTURES_DIR / "yellowed_scanned_watermark.pdf"
+    orig_bytes = len(input_pdf.read_bytes())
+
+    # Simulate Pass 1 producing only a 2% size reduction (which is < 5% minimal yield threshold)
+    def fake_pymupdf(in_p, out_p, level="medium", aggressive=False):
+        with open(out_p, "wb") as f:
+            f.write(b"%PDF-1.4\n" + b"x" * int(orig_bytes * 0.98 - 15) + b"\n%%EOF")
+        return True
+
+    def fake_validate(in_p, comp_p, max_drop_threshold=0.18):
+        return True, {"pages_checked": [0]}
+
+    monkeypatch.setattr(comp_mod, "find_ghostscript", lambda: None)
+    monkeypatch.setattr(comp_mod, "compress_with_pymupdf", fake_pymupdf)
+    monkeypatch.setattr(comp_mod, "validate_content_preservation", fake_validate)
+
+    res = run_ghostscript_compression("test_min_yield_job", str(input_pdf), level="low")
+    assert res["status"] == "done"
+    assert res["already_optimal"] is True
+    assert res["message"] == comp_mod.OPTIMAL_COMPRESSION_MESSAGE
+
+
 
 

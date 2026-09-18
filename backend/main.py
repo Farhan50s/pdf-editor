@@ -1,7 +1,7 @@
 import os
 import shutil
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
@@ -32,7 +32,8 @@ FRONTEND_DIR = BASE_DIR / "frontend"
 
 class WatermarkRemoveRequest(BaseModel):
     job_id: str
-    candidate_id: str
+    candidate_ids: Optional[List[str]] = None
+    candidate_id: Optional[str] = None
 
 
 @app.get("/api/system/status")
@@ -70,7 +71,7 @@ async def compress_pdf(
 
     if not is_valid_pdf_signature(temp_input_path):
         cleanup_file_safely(temp_input_path)
-        raise HTTPException(status_code=400, detail="Invalid PDF file: Missing or invalid PDF signature header.")
+        raise HTTPException(status_code=400, detail="Invalid PDF file: Missing %PDF- signature.")
 
     orig_size_mb = get_file_size_mb(temp_input_path)
     job_id = create_job("compress", input_path=temp_input_path, original_size_mb=orig_size_mb)
@@ -94,12 +95,12 @@ async def compress_status(job_id: str):
     return {
         "status": job.get("status"),
         "progress": job.get("progress", 0),
-        "original_size_mb": job.get("original_size_mb", 0.0),
+        "original_size_mb": job.get("original_size_mb"),
         "compressed_size_mb": job.get("compressed_size_mb"),
         "download_url": job.get("download_url"),
-        "error_message": job.get("error_message"),
         "already_optimal": job.get("already_optimal", False),
-        "message": job.get("message")
+        "message": job.get("message"),
+        "error_message": job.get("error_message")
     }
 
 
@@ -111,7 +112,7 @@ async def compress_download(job_id: str, background_tasks: BackgroundTasks):
 
     output_path = job.get("output_path")
     if not output_path or not os.path.exists(output_path):
-        raise HTTPException(status_code=404, detail="Compressed file not found or expired.")
+        raise HTTPException(status_code=404, detail="Compressed PDF not found or expired.")
 
     # Schedule cleanup after download
     background_tasks.add_task(remove_job_files, job_id=job_id)
@@ -124,7 +125,7 @@ async def compress_download(job_id: str, background_tasks: BackgroundTasks):
 
 
 # ==========================================
-# Feature 2: PDF Watermark Removal Endpoints
+# Feature 2: Watermark Removal Endpoints
 # ==========================================
 
 @app.post("/api/watermark/detect")
@@ -143,7 +144,7 @@ async def watermark_detect(file: UploadFile = File(...)):
 
     if not is_valid_pdf_signature(temp_input_path):
         cleanup_file_safely(temp_input_path)
-        raise HTTPException(status_code=400, detail="Invalid PDF file: Missing or invalid PDF signature header.")
+        raise HTTPException(status_code=400, detail="Invalid PDF file: Missing %PDF- signature.")
 
     orig_size_mb = get_file_size_mb(temp_input_path)
     job_id = create_job("watermark_detect", input_path=temp_input_path, original_size_mb=orig_size_mb)
@@ -178,10 +179,19 @@ async def watermark_remove(req: WatermarkRemoveRequest, background_tasks: Backgr
     if not job:
         raise HTTPException(status_code=404, detail="Watermark job not found.")
 
+    target_ids = []
+    if req.candidate_ids:
+        target_ids.extend([cid.strip() for cid in req.candidate_ids if cid.strip()])
+    elif req.candidate_id:
+        target_ids.append(req.candidate_id.strip())
+
+    if not target_ids:
+        raise HTTPException(status_code=400, detail="No candidate_ids specified for removal.")
+
     candidates = job.get("candidates", [])
-    matching_candidate = next((c for c in candidates if c.get("candidate_id") == req.candidate_id), None)
-    if not matching_candidate:
-        raise HTTPException(status_code=400, detail=f"Candidate {req.candidate_id} not found in this job.")
+    matching_candidates = [c for c in candidates if c.get("candidate_id") in target_ids]
+    if not matching_candidates:
+        raise HTTPException(status_code=400, detail=f"None of candidates {target_ids} found in this job.")
 
     input_path = job.get("input_path")
     if not input_path or not os.path.exists(input_path):
@@ -190,12 +200,12 @@ async def watermark_remove(req: WatermarkRemoveRequest, background_tasks: Backgr
     # Create new job ID for tracking the removal process
     remove_job_id = create_job("watermark_remove", input_path=input_path, original_size_mb=job.get("original_size_mb", 0.0))
 
-    # Background task for removal
+    # Background task for removal (processes all candidates in a single page pass)
     background_tasks.add_task(
         remove_watermark,
         job_id=remove_job_id,
         input_path=input_path,
-        candidate=matching_candidate
+        candidates=matching_candidates
     )
 
     return {"job_id": remove_job_id}
@@ -210,6 +220,7 @@ async def watermark_status(job_id: str):
         "status": job.get("status"),
         "progress": job.get("progress", 0),
         "pages_cleaned": job.get("pages_cleaned", 0),
+        "candidates_removed": job.get("candidates_removed", []),
         "download_url": job.get("download_url"),
         "error_message": job.get("error_message")
     }

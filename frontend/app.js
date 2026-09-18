@@ -2,12 +2,21 @@
 let selectedCompressFile = null;
 let selectedCompressLevel = "medium";
 let compressPollInterval = null;
+let lastCompressPct = 0;
+let compressStartTime = null;
 
 let selectedWmFile = null;
 let wmJobId = null;
 let wmCandidates = [];
 let selectedCandidateId = null;
 let wmPollInterval = null;
+let lastWmPct = 0;
+
+const LEVEL_DESCRIPTIONS = {
+  low: "Reduces size by 10–30%, high quality (prepress)",
+  medium: "Reduces size by 30–60%, balanced quality",
+  high: "Reduces size by 50–80%, smallest size"
+};
 
 // Initialize on DOM load
 document.addEventListener("DOMContentLoaded", () => {
@@ -18,7 +27,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
 function switchTab(tabName) {
   document.querySelectorAll(".tab-btn").forEach(btn => btn.classList.remove("active"));
-  document.querySelectorAll(".tab-content").forEach(content => content.classList.remove("active"));
+  document.querySelectorAll(".tab-pane").forEach(content => content.classList.remove("active"));
 
   if (tabName === "compress") {
     document.getElementById("tab-btn-compress").classList.add("active");
@@ -34,12 +43,15 @@ async function checkSystemStatus() {
     const res = await fetch("/api/system/status");
     if (res.ok) {
       const data = await res.json();
+      const alertBox = document.getElementById("gs-alert");
       if (!data.ghostscript_available) {
-        document.getElementById("gs-alert").style.display = "flex";
+        alertBox.style.display = "block";
+      } else {
+        alertBox.style.display = "none";
       }
     }
   } catch (e) {
-    // API not started yet or offline
+    // API offline
   }
 }
 
@@ -77,7 +89,7 @@ function setupDropzone(dropzoneId, inputId, onFileSelect) {
 }
 
 // ==========================================
-// Feature 1: Compression Logic
+// Compression
 // ==========================================
 function handleCompressFileSelect(file) {
   if (!file.name.toLowerCase().endsWith(".pdf")) {
@@ -95,8 +107,13 @@ function handleCompressFileSelect(file) {
 
 function selectLevel(level) {
   selectedCompressLevel = level;
-  document.querySelectorAll(".level-btn").forEach(btn => btn.classList.remove("selected"));
-  document.getElementById(`btn-level-${level}`).classList.add("selected");
+  const radio = document.querySelector(`input[name="compress-level"][value="${level}"]`);
+  if (radio) radio.checked = true;
+
+  const desc = document.getElementById("level-detail-text");
+  if (desc) {
+    desc.textContent = LEVEL_DESCRIPTIONS[level] || "";
+  }
 }
 
 async function startCompression() {
@@ -107,14 +124,16 @@ async function startCompression() {
   document.getElementById("btn-compress-submit").disabled = true;
 
   const progressBox = document.getElementById("compress-progress");
-  const progressBar = document.getElementById("compress-progress-bar");
-  const progressPercent = document.getElementById("compress-progress-percent");
-  const progressStatus = document.getElementById("compress-progress-status");
+  const spinnerMode = document.getElementById("compress-spinner-mode");
+  const barMode = document.getElementById("compress-bar-mode");
 
   progressBox.style.display = "block";
-  progressBar.style.width = "10%";
-  progressPercent.textContent = "10%";
-  progressStatus.textContent = "Uploading PDF to local engine...";
+  spinnerMode.style.display = "flex";
+  barMode.style.display = "none";
+  document.getElementById("compress-spinner-text").textContent = "Compressing PDF...";
+
+  lastCompressPct = 0;
+  compressStartTime = Date.now();
 
   const formData = new FormData();
   formData.append("file", selectedCompressFile);
@@ -132,10 +151,7 @@ async function startCompression() {
     }
 
     const data = await res.json();
-    const jobId = data.job_id;
-
-    // Start polling
-    pollCompressionStatus(jobId);
+    pollCompressionStatus(data.job_id);
   } catch (err) {
     showError("compress", err.message);
     progressBox.style.display = "none";
@@ -146,76 +162,140 @@ async function startCompression() {
 function pollCompressionStatus(jobId) {
   if (compressPollInterval) clearInterval(compressPollInterval);
 
+  const progressBox = document.getElementById("compress-progress");
+  const spinnerMode = document.getElementById("compress-spinner-mode");
+  const barMode = document.getElementById("compress-bar-mode");
+  const progressBar = document.getElementById("compress-progress-bar");
+  const progressStatus = document.getElementById("compress-progress-status");
+  const progressDetail = document.getElementById("compress-progress-detail");
+
   compressPollInterval = setInterval(async () => {
     try {
       const res = await fetch(`/api/compress/status/${jobId}`);
-      if (!res.ok) {
-        throw new Error("Unable to fetch compression progress.");
-      }
+      if (!res.ok) throw new Error("Unable to fetch compression progress.");
 
       const job = await res.json();
-      const progressBox = document.getElementById("compress-progress");
-      const progressBar = document.getElementById("compress-progress-bar");
-      const progressPercent = document.getElementById("compress-progress-percent");
-      const progressStatus = document.getElementById("compress-progress-status");
+      const elapsedMs = Date.now() - (compressStartTime || Date.now());
+      const elapsedSec = Math.floor(elapsedMs / 1000);
 
       if (job.status === "processing") {
-        const pct = Math.max(15, job.progress || 35);
-        progressBar.style.width = `${pct}%`;
-        progressPercent.textContent = `${pct}%`;
-        progressStatus.textContent = "Compressing PDF with Ghostscript...";
-      } else if (job.status === "done") {
-        clearInterval(compressPollInterval);
-        progressBar.style.width = "100%";
-        progressPercent.textContent = "100%";
-        progressStatus.textContent = "Complete!";
-        setTimeout(() => { progressBox.style.display = "none"; }, 500);
-
-        // Show result
-        document.getElementById("metric-orig-size").textContent = `${job.original_size_mb} MB`;
-        document.getElementById("metric-comp-size").textContent = `${job.compressed_size_mb} MB`;
-        
-        const optimalNotice = document.getElementById("compress-optimal-notice");
-        const btnText = document.getElementById("compress-download-btn-text");
-
-        if (job.already_optimal) {
-          if (optimalNotice) {
-            document.getElementById("compress-optimal-message").textContent = job.message || "This file is already efficiently compressed. Compression could not reduce it further.";
-            optimalNotice.style.display = "flex";
+        if (elapsedMs >= 2500) {
+          if (spinnerMode.style.display !== "none") {
+            spinnerMode.style.display = "none";
+            barMode.style.display = "block";
           }
-          document.getElementById("metric-saved-pct").textContent = "0%";
-          if (btnText) btnText.textContent = "Download Original PDF";
+          const rawPct = Math.min(95, Math.max(10, job.progress || Math.min(95, elapsedSec * 5)));
+          lastCompressPct = Math.max(lastCompressPct, rawPct);
+          const pct = lastCompressPct;
+
+          progressBar.style.width = `${pct}%`;
+          progressStatus.textContent = "Compressing PDF...";
+          progressDetail.textContent = `(${elapsedSec}s elapsed)`;
         } else {
-          if (optimalNotice) optimalNotice.style.display = "none";
-          let savedPct = 0;
-          if (job.original_size_mb > 0 && job.compressed_size_mb !== null) {
-            savedPct = Math.max(0, Math.round((1 - job.compressed_size_mb / job.original_size_mb) * 100));
-          }
-          document.getElementById("metric-saved-pct").textContent = `${savedPct}%`;
-          if (btnText) btnText.textContent = "Download Compressed PDF";
+          document.getElementById("compress-spinner-text").textContent = `Compressing PDF... (${elapsedSec}s)`;
         }
 
-        const dlBtn = document.getElementById("compress-download-btn");
-        dlBtn.href = job.download_url;
-        document.getElementById("compress-result").style.display = "block";
-        document.getElementById("btn-compress-submit").disabled = false;
+      } else if (job.status === "done") {
+        clearInterval(compressPollInterval);
+        compressPollInterval = null;
+
+        if (elapsedMs < 2500) {
+          progressBox.style.display = "none";
+        } else {
+          progressBar.style.width = "100%";
+          progressStatus.textContent = "Complete";
+          progressDetail.textContent = `(${elapsedSec}s)`;
+          setTimeout(() => { progressBox.style.display = "none"; }, 250);
+        }
+
+        renderCompressionResult(job);
+
       } else if (job.status === "error") {
         clearInterval(compressPollInterval);
+        compressPollInterval = null;
         progressBox.style.display = "none";
         document.getElementById("btn-compress-submit").disabled = false;
         showError("compress", job.error_message || "An error occurred during compression.");
       }
     } catch (e) {
       clearInterval(compressPollInterval);
+      compressPollInterval = null;
       document.getElementById("compress-progress").style.display = "none";
       document.getElementById("btn-compress-submit").disabled = false;
       showError("compress", e.message);
     }
-  }, 1000);
+  }, 350);
+}
+
+function renderCompressionResult(job) {
+  const resultBox = document.getElementById("compress-result");
+  const optimalNotice = document.getElementById("compress-optimal-notice");
+  const btnText = document.getElementById("compress-download-btn-text");
+  const resultMarker = document.getElementById("compress-result-marker");
+
+  const origMb = Number(job.original_size_mb || 0).toFixed(2);
+  const compMb = Number(job.compressed_size_mb || origMb).toFixed(2);
+
+  // Single accurate size display (bug fixed)
+  document.getElementById("chart-orig-val").textContent = `${origMb} MB`;
+  document.getElementById("chart-comp-val").textContent = `${compMb} MB`;
+
+  // Proportional 6px horizontal bars
+  const origVal = Math.max(0.01, Number(job.original_size_mb || 0));
+  const compVal = Math.max(0.01, Number(job.compressed_size_mb || origVal));
+  const compRatio = Math.min(100, Math.max(3, Math.round((compVal / origVal) * 100)));
+
+  document.getElementById("chart-orig-bar").style.width = "100%";
+  document.getElementById("chart-comp-bar").style.width = `${compRatio}%`;
+
+  if (job.already_optimal) {
+    resultBox.classList.remove("state-success");
+    resultBox.classList.add("state-optimal");
+    resultMarker.textContent = "ⓘ";
+    optimalNotice.style.display = "block";
+    document.getElementById("metric-saved-pct").textContent = "0%";
+    if (btnText) btnText.textContent = "Download original PDF";
+  } else {
+    resultBox.classList.remove("state-optimal");
+    resultBox.classList.add("state-success");
+    resultMarker.textContent = "✓";
+    optimalNotice.style.display = "none";
+
+    let savedPct = 0;
+    if (job.original_size_mb > 0 && job.compressed_size_mb !== null) {
+      savedPct = Math.max(0, Math.round((1 - job.compressed_size_mb / job.original_size_mb) * 100));
+    }
+    document.getElementById("metric-saved-pct").textContent = `${savedPct}%`;
+    if (btnText) btnText.textContent = "Download compressed PDF";
+  }
+
+  const dlBtn = document.getElementById("compress-download-btn");
+  dlBtn.href = job.download_url;
+  resultBox.style.display = "block";
+  document.getElementById("btn-compress-submit").disabled = false;
+}
+
+function resetCompress() {
+  if (compressPollInterval) {
+    clearInterval(compressPollInterval);
+    compressPollInterval = null;
+  }
+  selectedCompressFile = null;
+  lastCompressPct = 0;
+  compressStartTime = null;
+
+  const fileInput = document.getElementById("compress-file-input");
+  if (fileInput) fileInput.value = "";
+
+  document.getElementById("compress-file-badge").style.display = "none";
+  document.getElementById("compress-progress").style.display = "none";
+  document.getElementById("compress-result").style.display = "none";
+  hideError("compress");
+  document.getElementById("btn-compress-submit").disabled = true;
 }
 
 // ==========================================
-// Feature 2: Watermark Removal Logic
+// Watermark Removal
 // ==========================================
 function handleWmFileSelect(file) {
   if (!file.name.toLowerCase().endsWith(".pdf")) {
@@ -246,7 +326,7 @@ async function startWatermarkDetection() {
   const loading = document.getElementById("wm-detect-loading");
 
   detectBtn.disabled = true;
-  loading.style.display = "block";
+  loading.style.display = "flex";
 
   const formData = new FormData();
   formData.append("file", selectedWmFile);
@@ -270,7 +350,7 @@ async function startWatermarkDetection() {
     wmCandidates = data.candidates || [];
 
     if (data.scanned_pdf_warning) {
-      document.getElementById("wm-scanned-warning").style.display = "flex";
+      document.getElementById("wm-scanned-warning").style.display = "block";
     }
 
     if (wmCandidates.length === 0) {
@@ -299,7 +379,7 @@ function renderCandidates(candidates) {
     card.id = `cand-${cand.candidate_id}`;
     card.onclick = () => selectCandidate(cand.candidate_id);
 
-    const typeBadge = cand.type.toUpperCase();
+    const typeBadge = cand.type;
     const sample = cand.sample_text ? `"${cand.sample_text}"` : (cand.type === "image" ? "Image Logo / Stamp" : "Vector Art Stamp");
     const previewUrl = cand.page_preview_image_url;
     const coverage = cand.estimated_coverage || `Confidence: ${Math.round(cand.confidence * 100)}%`;
@@ -307,7 +387,7 @@ function renderCandidates(candidates) {
     card.innerHTML = `
       <img class="candidate-preview-img" src="${previewUrl}" alt="Page 1 Preview">
       <div class="candidate-details">
-        <span class="candidate-type">${typeBadge}</span>
+        <div class="candidate-type">${typeBadge}</div>
         <div class="candidate-sample">${sample}</div>
         <div class="candidate-meta">${coverage}</div>
       </div>
@@ -333,13 +413,14 @@ async function startWatermarkRemoval() {
 
   const progressBox = document.getElementById("wm-progress");
   const progressBar = document.getElementById("wm-progress-bar");
-  const progressPercent = document.getElementById("wm-progress-percent");
   const progressStatus = document.getElementById("wm-progress-status");
+  const progressDetail = document.getElementById("wm-progress-detail");
 
+  lastWmPct = 0;
   progressBox.style.display = "block";
   progressBar.style.width = "0%";
-  progressPercent.textContent = "0%";
-  progressStatus.textContent = "Preparing surgical page cleaning...";
+  progressStatus.textContent = "Cleaning pages...";
+  progressDetail.textContent = "";
 
   try {
     const res = await fetch("/api/watermark/remove", {
@@ -357,9 +438,7 @@ async function startWatermarkRemoval() {
     }
 
     const data = await res.json();
-    const removalJobId = data.job_id;
-
-    pollWatermarkStatus(removalJobId);
+    pollWatermarkStatus(data.job_id);
   } catch (err) {
     progressBox.style.display = "none";
     document.getElementById("btn-wm-remove").disabled = false;
@@ -370,47 +449,89 @@ async function startWatermarkRemoval() {
 function pollWatermarkStatus(jobId) {
   if (wmPollInterval) clearInterval(wmPollInterval);
 
+  const progressBox = document.getElementById("wm-progress");
+  const progressBar = document.getElementById("wm-progress-bar");
+  const progressStatus = document.getElementById("wm-progress-status");
+  const progressDetail = document.getElementById("wm-progress-detail");
+
   wmPollInterval = setInterval(async () => {
     try {
       const res = await fetch(`/api/watermark/status/${jobId}`);
       if (!res.ok) throw new Error("Unable to fetch removal progress.");
 
       const job = await res.json();
-      const progressBox = document.getElementById("wm-progress");
-      const progressBar = document.getElementById("wm-progress-bar");
-      const progressPercent = document.getElementById("wm-progress-percent");
-      const progressStatus = document.getElementById("wm-progress-status");
 
       if (job.status === "processing") {
-        const pct = job.progress || 0;
+        const pct = Math.max(lastWmPct, job.progress || 0);
+        lastWmPct = pct;
+
         progressBar.style.width = `${pct}%`;
-        progressPercent.textContent = `${pct}%`;
-        progressStatus.textContent = `Cleaned page ${job.pages_cleaned} (${pct}% complete)...`;
+
+        const curPage = job.pages_cleaned || 0;
+        const totalPages = job.total_pages || 0;
+        const pps = job.pages_per_sec || 0;
+        const remainingPages = Math.max(0, totalPages - curPage);
+        const etaSec = pps > 0 && remainingPages > 0 ? Math.ceil(remainingPages / pps) : null;
+        const etaText = etaSec !== null ? ` • ~${etaSec}s left` : "";
+        const ppsText = pps > 0 ? ` • ${pps} p/s` : "";
+
+        progressStatus.textContent = `Page ${curPage} of ${totalPages} (${pct}%)`;
+        progressDetail.textContent = `${ppsText}${etaText}`.trim();
+
       } else if (job.status === "done") {
         clearInterval(wmPollInterval);
-        progressBar.style.width = "100%";
-        progressPercent.textContent = "100%";
-        progressStatus.textContent = "Finished!";
-        setTimeout(() => { progressBox.style.display = "none"; }, 500);
+        wmPollInterval = null;
 
-        document.getElementById("wm-cleaned-summary").textContent = `Cleaned ${job.pages_cleaned} pages. Verification passed.`;
+        progressBar.style.width = "100%";
+        progressStatus.textContent = "Complete";
+        progressDetail.textContent = `Cleaned ${job.pages_cleaned} pages`;
+
+        setTimeout(() => { progressBox.style.display = "none"; }, 300);
+
+        document.getElementById("wm-cleaned-count").textContent = job.pages_cleaned || 0;
         const dlBtn = document.getElementById("wm-download-btn");
         dlBtn.href = job.download_url;
         document.getElementById("wm-result").style.display = "block";
         document.getElementById("btn-wm-remove").disabled = false;
+
       } else if (job.status === "error") {
         clearInterval(wmPollInterval);
+        wmPollInterval = null;
         progressBox.style.display = "none";
         document.getElementById("btn-wm-remove").disabled = false;
         showError("wm", job.error_message || "Watermark removal failed.");
       }
     } catch (e) {
       clearInterval(wmPollInterval);
+      wmPollInterval = null;
       document.getElementById("wm-progress").style.display = "none";
       document.getElementById("btn-wm-remove").disabled = false;
       showError("wm", e.message);
     }
-  }, 1000);
+  }, 350);
+}
+
+function resetWatermark() {
+  if (wmPollInterval) {
+    clearInterval(wmPollInterval);
+    wmPollInterval = null;
+  }
+  selectedWmFile = null;
+  wmJobId = null;
+  wmCandidates = [];
+  selectedCandidateId = null;
+  lastWmPct = 0;
+
+  const fileInput = document.getElementById("wm-file-input");
+  if (fileInput) fileInput.value = "";
+
+  document.getElementById("wm-file-badge").style.display = "none";
+  document.getElementById("wm-candidates-section").style.display = "none";
+  document.getElementById("wm-progress").style.display = "none";
+  document.getElementById("wm-result").style.display = "none";
+  document.getElementById("wm-scanned-warning").style.display = "none";
+  hideError("wm");
+  document.getElementById("btn-wm-detect").disabled = true;
 }
 
 // ==========================================

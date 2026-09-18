@@ -114,12 +114,51 @@ def make_image_watermark_pdf(target_path: Path, logo_path: Path, num_pages: int 
     c.save()
 
 
+def make_multi_watermark_pdf(target_path: Path, logo_path: Path, num_pages: int = 10):
+    """
+    Generates a PDF with unique body text and TWO distinct repeating watermarks on every page:
+    1. A repeated diagonal text watermark: 'CONFIDENTIAL DRAFT'
+    2. A repeated image logo watermark at top-right
+    """
+    if target_path.exists() and target_path.stat().st_size > 1000:
+        return
+    c = canvas.Canvas(str(target_path), pagesize=letter)
+    width, height = letter
+
+    for page_num in range(1, num_pages + 1):
+        # 1. Unique body text
+        c.setFont("Helvetica-Bold", 14)
+        c.drawString(72, height - 72, f"Technical Specification Document — Section {page_num}")
+        c.setFont("Helvetica", 11)
+        for line_idx in range(14):
+            c.drawString(72, height - 100 - (line_idx * 22), f"Proprietary algorithm specification line {line_idx} with seed value {page_num * 50 + line_idx}")
+
+        # 2. Repeated Image Watermark (Logo at top-right)
+        c.drawImage(str(logo_path), width - 180, height - 65, width=110, height=45, mask="auto")
+
+        # 3. Repeated Text Watermark (Diagonal rotated text)
+        c.saveState()
+        c.setFont("Helvetica-Bold", 40)
+        c.setFillColor(colors.Color(0.85, 0.15, 0.15, alpha=0.35))
+        c.translate(width / 2, height / 2)
+        c.rotate(45)
+        c.drawCentredString(0, 0, "CONFIDENTIAL DRAFT")
+        c.restoreState()
+
+        c.setFont("Helvetica", 10)
+        c.setFillColor(colors.black)
+        c.drawString(72, 40, f"Page {page_num} of {num_pages}")
+        c.showPage()
+
+    c.save()
+
+
 def make_large_plain_pdf(target_path: Path, num_pages: int = 500):
     """
     Generates a ~40-60MB plain PDF of 500 pages with varied images for compression tests.
     Caches generation to ensure fast test suites.
     """
-    if target_path.exists() and target_path.stat().st_size > 35 * 1024 * 1024:
+    if target_path.exists() and target_path.stat().st_size > 10 * 1024 * 1024:
         return  # Cached!
 
     print("Generating 45MB large_plain.pdf with distinct embedded images...")
@@ -227,6 +266,52 @@ def make_halftone_scanned_pdf(target_path: Path, num_pages: int = 5):
     print(f"[Fixtures] Generated halftone_scanned.pdf with size: {target_path.stat().st_size} bytes")
 
 
+def make_yellowed_scanned_watermark_pdf(target_path: Path, num_pages: int = 5):
+    """
+    Generates a synthetic scanned book PDF with:
+    - Yellowed/off-white background (~180 luminance, e.g. RGB(185, 180, 168)).
+    - Book body content (statistical equations and typography).
+    - Repeating overlay watermark stamps in header and footer (top 12% and bottom 10%).
+    """
+    if target_path.exists() and target_path.stat().st_size > 500:
+        return
+
+    import fitz
+
+    doc = fitz.open()
+    for p in range(num_pages):
+        img = PILImage.new("RGB", (850, 1100), (185, 180, 168))
+        draw = PILImageDraw.Draw(img)
+
+        # 1. Header watermark (in the top 12% exclusion band: y < 132)
+        draw.text((120, 45), "--- PROPERTY OF ARCHIVE LIBRARY - WATERMARK DO NOT REMOVE ---", fill=(80, 75, 70))
+        draw.line([(50, 85), (800, 85)], fill=(120, 115, 105), width=2)
+
+        # 2. Main body content (central 78% of height: y between 132 and 990)
+        draw.text((70, 150), f"CHAPTER {p + 1}: STATISTICAL INFERENCE & HYPOTHESIS TESTING", fill=(30, 25, 20))
+        for y in range(200, 930, 28):
+            draw.text(
+                (70, y),
+                f"Equation [{p + 1}.{y // 28}]: Let X_1, ..., X_n be i.i.d. with density f(x; theta). The likelihood function L(theta) = prod f(X_i; theta).",
+                fill=(35, 30, 25)
+            )
+
+        # 3. Footer watermark (in the bottom 10% exclusion band: y > 990)
+        draw.line([(50, 1000), (800, 1000)], fill=(120, 115, 105), width=2)
+        draw.text((180, 1025), "DIGITIZED WATERMARK STAMP - FREE SCAN - WWW.ACADEMICARCHIVE.ORG", fill=(75, 70, 65))
+        draw.text((410, 1055), f"Page {p + 1} of {num_pages}", fill=(40, 35, 30))
+
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+
+        page = doc.new_page(width=612, height=792)
+        page.insert_image(page.rect, stream=buf.getvalue())
+
+    doc.save(str(target_path), garbage=4, deflate=True, clean=True)
+    doc.close()
+    print(f"[Fixtures] Generated yellowed_scanned_watermark.pdf with size: {target_path.stat().st_size} bytes")
+
+
 def generate_all_fixtures():
     """Generates all test PDFs into tests/fixtures/ with caching."""
     logo_path = FIXTURES_DIR / "sample_logo.png"
@@ -258,6 +343,12 @@ def generate_all_fixtures():
 
     print("[Fixtures] Generating halftone_scanned.pdf...")
     make_halftone_scanned_pdf(FIXTURES_DIR / "halftone_scanned.pdf", num_pages=5)
+
+    print("[Fixtures] Generating yellowed_scanned_watermark.pdf...")
+    make_yellowed_scanned_watermark_pdf(FIXTURES_DIR / "yellowed_scanned_watermark.pdf", num_pages=5)
+
+    print("[Fixtures] Generating multi_watermark.pdf...")
+    make_multi_watermark_pdf(FIXTURES_DIR / "multi_watermark.pdf", logo_path, num_pages=10)
 
     print("[Fixtures] All test fixtures ready in tests/fixtures/.")
 

@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import math
 import random
 import hashlib
@@ -289,7 +290,41 @@ def detect_watermarks(file_path: str, job_id: str) -> Dict[str, Any]:
         # Provide user-friendly recurrence label
         pct = int(cand["confidence"] * 100)
         cand["estimated_coverage"] = f"Found on ~{pct}% of sampled pages ({cand['pages_found_on']}/{sample_count} sampled)"
+        cand["possibly_same_watermark"] = False
         candidates_output.append(cand)
+
+    # Detect fragmented text runs on page 1 sharing the same row and adjacent x-ranges
+    for i in range(len(candidates_output)):
+        for j in range(i + 1, len(candidates_output)):
+            c1 = candidates_output[i]
+            c2 = candidates_output[j]
+            b1 = c1.get("bbox")
+            b2 = c2.get("bbox")
+            if not b1 or not b2:
+                continue
+
+            # Compare if on the same first_seen_page
+            if c1.get("first_seen_page") == c2.get("first_seen_page"):
+                y0_1, y1_1 = b1[1], b1[3]
+                y0_2, y1_2 = b2[1], b2[3]
+
+                # Row alignment: vertical coordinates match within 6 points
+                same_row = abs(y0_1 - y0_2) <= 6.0 and abs(y1_1 - y1_2) <= 6.0
+
+                # Horizontal adjacency: gap between boxes <= 35 points
+                x0_1, x1_1 = b1[0], b1[2]
+                x0_2, x1_2 = b2[0], b2[2]
+
+                if x1_1 <= x0_2:
+                    h_gap = x0_2 - x1_1
+                elif x1_2 <= x0_1:
+                    h_gap = x0_1 - x1_2
+                else:
+                    h_gap = 0.0
+
+                if same_row and h_gap <= 35.0:
+                    c1["possibly_same_watermark"] = True
+                    c2["possibly_same_watermark"] = True
 
     # Scanned PDF check
     warning = None
@@ -317,16 +352,34 @@ def detect_watermarks(file_path: str, job_id: str) -> Dict[str, Any]:
     return result
 
 
-def remove_watermark(job_id: str, input_path: str, candidate: Dict[str, Any]) -> Dict[str, Any]:
+def remove_watermark(
+    job_id: str,
+    input_path: str,
+    candidate: Optional[Dict[str, Any]] = None,
+    candidates: Optional[List[Dict[str, Any]]] = None
+) -> Dict[str, Any]:
     """
-    Surgically removes the selected watermark candidate.
+    Surgically removes one or more selected watermark candidates in a SINGLE page pass.
     Crucial Safeguards:
     - Redacts individual text spans (tight boxes), NEVER giant line/block bounding boxes.
     - Applies redactions with images=PDF_REDACT_IMAGE_NONE and graphics=PDF_REDACT_LINE_ART_NONE
       so underlying graphics, charts, and diagrams are 100% preserved.
     - Deletes image XObjects and cleans stream references.
-    - Verifies 20-30 pages post-removal including first and last pages.
+    - Processes every page exactly once for all selected candidates, avoiding O(N * K) processing.
+    - Deep verification samples 20-30 pages post-removal asserting ALL selected watermarks are gone.
     """
+    # Normalize candidates input to a list
+    cand_list: List[Dict[str, Any]] = []
+    if candidates:
+        cand_list = list(candidates)
+    elif candidate:
+        cand_list = [candidate]
+
+    if not cand_list:
+        err_msg = "No watermark candidates specified for removal."
+        update_job(job_id, status="error", error_message=err_msg)
+        return {"status": "error", "error_message": err_msg}
+
     if not os.path.exists(input_path):
         err_msg = "Input PDF file not found on disk."
         update_job(job_id, status="error", error_message=err_msg)
@@ -340,67 +393,98 @@ def remove_watermark(job_id: str, input_path: str, candidate: Dict[str, Any]) ->
         return {"status": "error", "error_message": err_msg}
 
     total_pages = doc.page_count
-    update_job(job_id, status="processing", progress=0, total_pages=total_pages, pages_cleaned=0)
+    start_cleaning_time = time.time()
+    update_job(job_id, status="processing", progress=0, total_pages=total_pages, pages_cleaned=0, pages_per_sec=0.0)
 
-    cand_type = candidate.get("type", "text")
-    target_text = normalize_text(candidate.get("sample_text", "")) if cand_type == "text" else None
-    target_xref = candidate.get("xref")
-    target_hash = candidate.get("image_hash")
-    target_rect = candidate.get("bbox")
+    # Partition targets across all selected candidates
+    target_texts: List[str] = []
+    target_xrefs: Set[int] = set()
+    target_hashes: Set[str] = set()
+    target_rects: List[List[float]] = []
+    candidates_removed_ids: List[str] = []
 
-    # Process page by page with strict memory release
+    for c in cand_list:
+        cid = c.get("candidate_id")
+        if cid:
+            candidates_removed_ids.append(cid)
+        ctype = c.get("type", "text")
+        if ctype == "text":
+            st = c.get("sample_text")
+            if st:
+                target_texts.append(normalize_text(st))
+        elif ctype == "image":
+            if c.get("xref") is not None:
+                target_xrefs.add(c["xref"])
+            if c.get("image_hash"):
+                target_hashes.add(c["image_hash"])
+        elif ctype == "vector":
+            r = c.get("bbox") or c.get("rect")
+            if r:
+                target_rects.append(list(r))
+
+    # Process page by page in a SINGLE pass with strict memory release
     for page_num in range(total_pages):
         page = doc[page_num]
+        redaction_added = False
 
-        if cand_type == "text" and target_text:
-            # 1. Surgical Text Redaction:
-            # Iterate through each span to redact only the specific span rect
+        # 1. Surgical Text Redactions (all text targets in one pass)
+        if target_texts:
             page_dict = page.get_text("dict")
-            redaction_added = False
-            
             for block in page_dict.get("blocks", []):
                 if block.get("type") == 0:
                     for line in block.get("lines", []):
                         for span in line.get("spans", []):
                             span_text = normalize_text(span.get("text", ""))
-                            # Match target text exactly or target text inside span
-                            if span_text == target_text or (len(target_text) > 4 and target_text in span_text):
+                            if not span_text:
+                                continue
+                            matched = False
+                            for t_text in target_texts:
+                                if span_text == t_text or (len(t_text) > 4 and t_text in span_text):
+                                    matched = True
+                                    break
+                            if matched:
                                 span_bbox = span.get("bbox")
                                 if span_bbox:
-                                    # Add redaction specifically to the span rectangle
                                     page.add_redact_annot(fitz.Rect(span_bbox), fill=None)
                                     redaction_added = True
 
-            if redaction_added:
-                # CRITICAL: Preserve all images and line art/drawings!
-                page.apply_redactions(
-                    images=fitz.PDF_REDACT_IMAGE_NONE,
-                    graphics=fitz.PDF_REDACT_LINE_ART_NONE
-                )
+        # 2. Vector Watermark Redactions (all vector targets in one pass)
+        if target_rects:
+            for v_rect in target_rects:
+                page.add_redact_annot(fitz.Rect(v_rect), fill=None)
+                redaction_added = True
 
-        elif cand_type == "image":
-            # 2. Surgical Image Watermark Deletion:
-            # Locate matching image XObject by xref or hash, find its resource name, and strip its Do operator
+        # Apply redactions once per page
+        if redaction_added:
+            page.apply_redactions(
+                images=fitz.PDF_REDACT_IMAGE_NONE,
+                graphics=fitz.PDF_REDACT_LINE_ART_NONE
+            )
+
+        # 3. Surgical Image Watermark Deletions (all image targets in one pass)
+        if target_xrefs or target_hashes:
             images_on_page = page.get_images(full=True)
             names_to_remove = set()
-            
+            matching_xrefs = set()
+
             for img_info in images_on_page:
                 xref = img_info[0]
-                img_name = img_info[7]  # Resource name in PDF stream
-                match = False
-                
-                if target_xref is not None and xref == target_xref:
-                    match = True
-                elif target_hash:
+                img_name = img_info[7]
+                matched = False
+                if xref in target_xrefs:
+                    matched = True
+                elif target_hashes:
                     try:
                         extracted = doc.extract_image(xref)
-                        if hashlib.md5(extracted.get("image", b"")).hexdigest() == target_hash:
-                            match = True
+                        if hashlib.md5(extracted.get("image", b"")).hexdigest() in target_hashes:
+                            matched = True
                     except Exception:
                         pass
 
-                if match and img_name:
-                    names_to_remove.add(img_name)
+                if matched:
+                    matching_xrefs.add(xref)
+                    if img_name:
+                        names_to_remove.add(img_name)
 
             if names_to_remove:
                 for cx in page.get_contents():
@@ -412,30 +496,28 @@ def remove_watermark(job_id: str, input_path: str, candidate: Dict[str, Any]) ->
                     except Exception:
                         pass
                 page.clean_contents()
-            else:
-                # Fallback: if no named XObject found in stream, call delete_image
-                for img_info in images_on_page:
-                    xref = img_info[0]
-                    if (target_xref and xref == target_xref) or target_hash:
-                        try:
-                            page.delete_image(xref)
-                        except Exception:
-                            pass
+            elif matching_xrefs:
+                for xref in matching_xrefs:
+                    try:
+                        page.delete_image(xref)
+                    except Exception:
+                        pass
                 page.clean_contents()
-
-        elif cand_type == "vector" and target_rect:
-            # 3. Vector Watermark Redaction:
-            # Redact drawing rectangle
-            page.add_redact_annot(fitz.Rect(target_rect), fill=None)
-            page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
 
         del page
 
         pages_done = page_num + 1
+        elapsed_sec = max(0.001, time.time() - start_cleaning_time)
+        pages_per_sec = round(pages_done / elapsed_sec, 1)
         progress = int((pages_done / total_pages) * 100)
-        
-        # Emits progress update
-        update_job(job_id, progress=progress, pages_cleaned=pages_done)
+
+        # Emits progress update with pages_per_sec throughput
+        update_job(
+            job_id,
+            progress=progress,
+            pages_cleaned=pages_done,
+            pages_per_sec=pages_per_sec
+        )
 
     # Save cleaned document with garbage collection and deflation
     output_filename = f"cleaned_{job_id}.pdf"
@@ -452,49 +534,67 @@ def remove_watermark(job_id: str, input_path: str, candidate: Dict[str, Any]) ->
     doc.close()
 
     # Step 7: Deep Verification — Sample 20-30 pages including first & last
+    # Verifies that ALL selected watermarks are gone from all sampled pages
     try:
         verify_doc = fitz.open(output_path)
         v_total = verify_doc.page_count
         
-        # Always check first (0), last (v_total - 1), plus up to 25 evenly spaced pages
         verify_count = min(30, v_total)
         step = (v_total - 1) / max(1, (verify_count - 1))
         verify_indices = sorted(list(set(int(round(i * step)) for i in range(verify_count))))
         
         watermark_still_present = False
+        failed_candidate_desc = ""
 
         for idx in verify_indices:
             v_page = verify_doc[idx]
-            if cand_type == "text" and target_text:
+            
+            # 1. Check all text candidates
+            if target_texts:
                 page_text = normalize_text(v_page.get_text())
-                if target_text in page_text:
-                    watermark_still_present = True
+                for t_text in target_texts:
+                    if t_text in page_text:
+                        watermark_still_present = True
+                        failed_candidate_desc = f"text watermark '{t_text}'"
+                        break
+                if watermark_still_present:
+                    del v_page
                     break
-            elif cand_type == "image":
+
+            # 2. Check all image candidates
+            if target_xrefs or target_hashes:
                 v_images = v_page.get_images(full=True)
                 for v_img in v_images:
                     v_xref = v_img[0]
-                    if target_xref and v_xref == target_xref:
+                    if v_xref in target_xrefs:
                         watermark_still_present = True
+                        failed_candidate_desc = f"image watermark xref {v_xref}"
                         break
-                    elif target_hash:
+                    elif target_hashes:
                         try:
                             ext = verify_doc.extract_image(v_xref)
-                            if hashlib.md5(ext.get("image", b"")).hexdigest() == target_hash:
+                            if hashlib.md5(ext.get("image", b"")).hexdigest() in target_hashes:
                                 watermark_still_present = True
+                                failed_candidate_desc = "image watermark hash match"
                                 break
                         except Exception:
                             pass
-                if watermark_still_present:
-                    break
+                    if watermark_still_present:
+                        break
+
             del v_page
+            if watermark_still_present:
+                break
 
         verify_doc.close()
 
         if watermark_still_present:
-            err_msg = "Watermark could not be fully removed on all pages."
+            err_msg = f"Watermark ({failed_candidate_desc}) could not be fully removed on all pages."
             update_job(job_id, status="error", error_message=err_msg)
-            log_job_event(job_id, "watermark_verify_fail", {"candidate": candidate})
+            log_job_event(job_id, "watermark_verify_fail", {
+                "candidates_removed": candidates_removed_ids,
+                "failed": failed_candidate_desc
+            })
             return {"status": "error", "error_message": err_msg}
 
     except Exception as e:
@@ -509,17 +609,20 @@ def remove_watermark(job_id: str, input_path: str, candidate: Dict[str, Any]) ->
         progress=100,
         output_path=output_path,
         download_url=download_url,
-        pages_cleaned=total_pages
+        pages_cleaned=total_pages,
+        candidates_removed=candidates_removed_ids
     )
     log_job_event(job_id, "watermark_remove_done", {
         "total_pages": total_pages,
-        "output_path": output_path
+        "output_path": output_path,
+        "candidates_removed": candidates_removed_ids
     })
     
     return {
         "status": "done",
         "progress": 100,
         "pages_cleaned": total_pages,
+        "candidates_removed": candidates_removed_ids,
         "output_path": output_path,
         "download_url": download_url
     }
