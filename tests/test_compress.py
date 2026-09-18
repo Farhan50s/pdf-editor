@@ -326,4 +326,77 @@ def test_compress_pass2_invalid_fallback(monkeypatch):
     assert dl_resp.content == orig_bytes
 
 
+def test_compress_halftone_scanned_content_preservation():
+    """
+    Regression test:
+    Compress a synthetic halftone-style scanned PDF fixture (dithered pattern with visible text,
+    similar to a real scanned textbook) through Medium and High compression.
+    Assert the output's sampled page darkness stays within 20% of the original.
+    Fail the test if any page comes back mostly blank.
+    """
+    input_pdf = FIXTURES_DIR / "halftone_scanned.pdf"
+    assert input_pdf.exists(), "halftone_scanned.pdf fixture must exist."
+
+    # Compute baseline darkness for all pages of the original PDF at 100 DPI
+    orig_doc = fitz.open(str(input_pdf))
+    zoom = 100.0 / 72.0
+    mat = fitz.Matrix(zoom, zoom)
+    orig_darkness = []
+    for page in orig_doc:
+        pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY)
+        darkness = 1.0 - (sum(pix.samples) / (len(pix.samples) * 255.0))
+        orig_darkness.append(darkness)
+    orig_doc.close()
+
+    assert all(d > 0.01 for d in orig_darkness), "Baseline pages must have visible content"
+
+    # Test both Medium and High compression levels
+    for level in ["medium", "high"]:
+        with open(input_pdf, "rb") as f:
+            resp = client.post(
+                "/api/compress",
+                files={"file": (f"halftone_{level}.pdf", f, "application/pdf")},
+                data={"level": level}
+            )
+        assert resp.status_code == 200
+        job_id = resp.json()["job_id"]
+
+        start_poll = time.time()
+        status_data = None
+        while time.time() - start_poll < 60:
+            status_resp = client.get(f"/api/compress/status/{job_id}")
+            status_data = status_resp.json()
+            if status_data["status"] in ["done", "error"]:
+                break
+            time.sleep(1)
+
+        assert status_data["status"] == "done", f"Compression failed: {status_data.get('error_message')}"
+        assert status_data["download_url"] is not None
+
+        dl_resp = client.get(status_data["download_url"])
+        assert dl_resp.status_code == 200
+        compressed_bytes = dl_resp.content
+
+        comp_doc = fitz.open(stream=compressed_bytes, filetype="pdf")
+        assert comp_doc.page_count == len(orig_darkness)
+
+        for p_idx in range(comp_doc.page_count):
+            pix_c = comp_doc[p_idx].get_pixmap(matrix=mat, colorspace=fitz.csGRAY)
+            darkness_c = 1.0 - (sum(pix_c.samples) / (len(pix_c.samples) * 255.0))
+
+            # Fail the test if any page comes back mostly blank
+            assert darkness_c >= 0.01, f"Level {level}, Page {p_idx} came back mostly blank (darkness={darkness_c:.4f})!"
+
+            # Assert output's sampled page darkness stays within 20% of original
+            d_orig = orig_darkness[p_idx]
+            rel_drop = (d_orig - darkness_c) / d_orig
+            assert rel_drop <= 0.20, (
+                f"Level {level}, Page {p_idx} suffered excessive darkness loss: "
+                f"orig={d_orig:.4f}, comp={darkness_c:.4f}, drop={rel_drop * 100:.1f}% > 20%"
+            )
+
+        comp_doc.close()
+
+
+
 

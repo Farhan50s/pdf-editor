@@ -194,6 +194,39 @@ def make_ccitt_scanned_pdf(target_path: Path, num_pages: int = 3):
     print(f"[Fixtures] Generated ccitt_scanned.pdf with size: {target_path.stat().st_size} bytes")
 
 
+def make_halftone_scanned_pdf(target_path: Path, num_pages: int = 5):
+    """
+    Generates a synthetic halftone-style scanned PDF fixture (dithered pattern with visible text,
+    similar to a real scanned textbook).
+    """
+    if target_path.exists() and target_path.stat().st_size > 500:
+        return
+
+    import fitz
+
+    doc = fitz.open()
+    for p in range(num_pages):
+        img = PILImage.new("L", (850, 1100), 255)
+        draw = PILImageDraw.Draw(img)
+        draw.text((70, 70), f"CHAPTER {p + 1}: PROBABILITY THEORY AND NORMAL DISTRIBUTION", fill=0)
+        for y in range(120, 960, 26):
+            draw.text((70, y), f"Section {y // 26}: The variance of random variable X is Var(X) = E[(X - mu)^2]. Equation [{p + 1}.{y // 26}]", fill=0)
+        draw.line([(70, 980), (780, 980)], fill=0, width=2)
+        draw.text((400, 1010), f"Page {p + 1} of {num_pages}", fill=0)
+
+        # Dither to halftone Floyd-Steinberg pattern
+        dithered = img.convert("1", dither=PILImage.Dither.FLOYDSTEINBERG)
+        buf = io.BytesIO()
+        dithered.save(buf, format="PNG")
+
+        page = doc.new_page(width=612, height=792)
+        page.insert_image(page.rect, stream=buf.getvalue())
+
+    doc.save(str(target_path), garbage=4, deflate=True, clean=True)
+    doc.close()
+    print(f"[Fixtures] Generated halftone_scanned.pdf with size: {target_path.stat().st_size} bytes")
+
+
 def generate_all_fixtures():
     """Generates all test PDFs into tests/fixtures/ with caching."""
     logo_path = FIXTURES_DIR / "sample_logo.png"
@@ -222,6 +255,9 @@ def generate_all_fixtures():
 
     print("[Fixtures] Generating ccitt_scanned.pdf...")
     make_ccitt_scanned_pdf(FIXTURES_DIR / "ccitt_scanned.pdf", num_pages=3)
+
+    print("[Fixtures] Generating halftone_scanned.pdf...")
+    make_halftone_scanned_pdf(FIXTURES_DIR / "halftone_scanned.pdf", num_pages=5)
 
     print("[Fixtures] All test fixtures ready in tests/fixtures/.")
 
